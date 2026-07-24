@@ -26,9 +26,16 @@ logger = logging.getLogger(__name__)
 DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
 
 
+def _escape_drive_query_value(value: str) -> str:
+    """Escapes a value for safe interpolation into a Drive `q` query string.
+    Without this, a folder/batch name containing a single quote (e.g.
+    "O'Brien's Section") breaks the query syntax and the API call fails."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
 def _find_conference_record(meet_service, space_id: str, session_start) -> Optional[str]:
     try:
-        response = meet_service.conferenceRecords().list(filter=f'space.name="{space_id}"').execute()
+        response = meet_service.conferenceRecords().list(filter=f'space.name = "{space_id}"').execute()
     except Exception as exc:
         logger.error("Failed to list conference records for space %s: %s", space_id, exc)
         return None
@@ -51,13 +58,20 @@ def _find_recording_file_id(meet_service, conference_record_name: str) -> Option
         return None
 
     recordings = response.get("recordings", [])
-    if not recordings:
-        return None
-    return recordings[0].get("driveDestination", {}).get("file")
+    for recording in recordings:
+        # Per the Meet API docs, driveDestination.file is only reliably
+        # populated once the recording session has reached FILE_GENERATED —
+        # earlier states (STARTED, ENDED) mean the MP4 isn't ready yet.
+        if recording.get("state") == "FILE_GENERATED":
+            file_id = recording.get("driveDestination", {}).get("file")
+            if file_id:
+                return file_id
+    return None
 
 
 def _find_or_create_folder(drive_service, name: str, parent_id: Optional[str] = None) -> str:
-    query = f"name = '{name}' and mimeType = '{DRIVE_FOLDER_MIME}' and trashed = false"
+    escaped_name = _escape_drive_query_value(name)
+    query = f"name = '{escaped_name}' and mimeType = '{DRIVE_FOLDER_MIME}' and trashed = false"
     if parent_id:
         query += f" and '{parent_id}' in parents"
 
@@ -66,6 +80,8 @@ def _find_or_create_folder(drive_service, name: str, parent_id: Optional[str] = 
     if existing:
         return existing[0]["id"]
 
+    # Use the raw (unescaped) name here — escaping is only needed inside the
+    # `q` query string above, not in the resource body sent to files.create.
     metadata = {"name": name, "mimeType": DRIVE_FOLDER_MIME}
     if parent_id:
         metadata["parents"] = [parent_id]
