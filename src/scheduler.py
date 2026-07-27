@@ -23,8 +23,6 @@ from src.drive_recording import try_file_recording_for_session
 
 logger = logging.getLogger(__name__)
 
-_recording_retry_counts: dict[int, int] = {}
-
 
 def reconcile_on_startup(calendar_service) -> None:
     logger.info("Startup reconciliation: syncing calendar...")
@@ -81,7 +79,11 @@ def _process_recordings(meet_service, drive_service, gmail_service) -> None:
         candidate_ids = [cs.id for cs in candidates]
 
     for session_id in candidate_ids:
-        attempts = _recording_retry_counts.get(session_id, 0)
+        with get_session() as session:
+            cs = session.query(ClassSession).filter_by(id=session_id).one()
+            attempts = cs.recording_retry_count
+            already_alerted = cs.recording_alert_sent
+
         if attempts >= settings.recording_check_max_retries:
             continue
 
@@ -92,12 +94,14 @@ def _process_recordings(meet_service, drive_service, gmail_service) -> None:
             logger.error("Unhandled error filing recording for session %s: %s", session_id, exc)
 
         if found:
-            _recording_retry_counts.pop(session_id, None)
-            continue
+            continue  # try_file_recording_for_session already marks recording_filed = True
 
         attempts += 1
-        _recording_retry_counts[session_id] = attempts
-        if attempts >= settings.recording_check_max_retries:
+        with get_session() as session:
+            cs = session.query(ClassSession).filter_by(id=session_id).one()
+            cs.recording_retry_count = attempts
+
+        if attempts >= settings.recording_check_max_retries and not already_alerted:
             logger.error("Recording never appeared for class_session_id=%s after %d attempts — alerting.", session_id, attempts)
             send_alert(
                 gmail_service,
@@ -107,6 +111,9 @@ def _process_recordings(meet_service, drive_service, gmail_service) -> None:
                     f"after {attempts} check(s). Please check Meet/Drive manually."
                 ),
             )
+            with get_session() as session:
+                cs = session.query(ClassSession).filter_by(id=session_id).one()
+                cs.recording_alert_sent = True
 
 
 def tick(calendar_service, meet_service, drive_service, gmail_service) -> None:
