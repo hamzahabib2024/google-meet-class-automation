@@ -52,10 +52,24 @@ def _load_and_validate(excel_path: str) -> pd.DataFrame:
     df = df.rename(columns=rename_map)
     df = df.dropna(how="all")
 
-    for col in REQUIRED_COLUMNS.values():
+    required_cols = list(REQUIRED_COLUMNS.values())
+
+    # Check for real NaN values *before* casting to str. astype(str) turns a
+    # missing cell into the literal string "nan", which would otherwise slip
+    # past a blank_mask check that only looks for "".
+    nan_mask = df[required_cols].isna().any(axis=1)
+    if nan_mask.any():
+        bad_rows = df[nan_mask].index.tolist()
+        raise ValueError(f"Excel file has blank required values in row(s): {bad_rows}.")
+
+    for col in required_cols:
         df[col] = df[col].astype(str).str.strip()
 
-    blank_mask = (df[list(REQUIRED_COLUMNS.values())] == "").any(axis=1)
+    # Belt-and-suspenders: also catch whitespace-only cells and the literal
+    # text "nan" in case a cell contained that string to begin with.
+    blank_mask = df[required_cols].apply(
+        lambda col: col.str.lower().isin(["", "nan", "none"])
+    ).any(axis=1)
     if blank_mask.any():
         bad_rows = df[blank_mask].index.tolist()
         raise ValueError(f"Excel file has blank required values in row(s): {bad_rows}.")
@@ -70,7 +84,10 @@ def import_batches_from_excel(excel_path: str) -> Dict[str, int]:
 
     with get_session() as session:
         for _, row in df.iterrows():
-            batch = session.query(Batch).filter_by(section_name=row["batch_name"]).one_or_none()
+            # Batch name is the destination folder name, not the unique Meet
+            # source. Use Meet link as the import identity so duplicate names
+            # do not overwrite each other.
+            batch = session.query(Batch).filter_by(meet_link=row["meet_link"]).one_or_none()
             if batch is None:
                 session.add(Batch(
                     section_name=row["batch_name"],
@@ -83,7 +100,7 @@ def import_batches_from_excel(excel_path: str) -> Dict[str, int]:
                 batch.subject = row["subject"]
                 batch.meet_link = row["meet_link"]
                 summary["batches_updated"] += 1
-                logger.info("Updated existing batch: %s", row["batch_name"])
+                logger.info("Updated existing Meet source for batch: %s", row["batch_name"])
 
     logger.info("Import complete: %s", summary)
     return summary
