@@ -15,6 +15,7 @@ recordings against current docs once real credentials are available.
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from src.config import settings
@@ -26,38 +27,143 @@ logger = logging.getLogger(__name__)
 DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
 
 
+def _escape_drive_query_value(value: str) -> str:
+    """Escapes a value for safe interpolation into a Drive `q` query string.
+    Without this, a folder/batch name containing a single quote (e.g.
+    "O'Brien's Section") breaks the query syntax and the API call fails."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
 def _find_conference_record(meet_service, space_id: str, session_start) -> Optional[str]:
     try:
-        response = meet_service.conferenceRecords().list(filter=f'space.name="{space_id}"').execute()
+        records = []
+        page_token = None
+        while True:
+            request = meet_service.conferenceRecords().list(
+                filter=f'space.name = "{space_id}"',
+                pageSize=100,
+                pageToken=page_token,
+            )
+            response = request.execute()
+            records.extend(response.get("conferenceRecords", []))
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
     except Exception as exc:
         logger.error("Failed to list conference records for space %s: %s", space_id, exc)
         return None
 
-    records = response.get("conferenceRecords", [])
+    if not records:
+        logger.info("No conference record found yet for Meet space %s", space_id)
+        return None
+
+    # Prefer the conference that belongs to this calendar occurrence. A
+    # permanent Meet link can have many conference records over time.
+    closest_record = None
+    closest_delta = None
     for record in records:
         record_start = record.get("startTime")
-        if record_start and session_start.isoformat()[:10] in record_start:
-            return record.get("name")
-    if records:
-        return records[0].get("name")
+        if not record_start or not record.get("name"):
+            continue
+        try:
+            start = datetime.fromisoformat(record_start.replace("Z", "+00:00"))
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=timezone.utc)
+            expected = session_start.replace(tzinfo=timezone.utc)
+            delta = abs((start - expected).total_seconds())
+            if closest_delta is None or delta < closest_delta:
+                closest_record = record.get("name")
+                closest_delta = delta
+        except ValueError:
+            continue
+
+    # Calendar and Meet timestamps can differ slightly. Do not associate a
+    # recording from a different class unless it started within two hours.
+    if closest_record is not None and closest_delta is not None and closest_delta <= 7200:
+        return closest_record
+
+    logger.warning("Conference records exist for %s, but none matched session start %s", space_id, session_start)
     return None
 
 
 def _find_recording_file_id(meet_service, conference_record_name: str) -> Optional[str]:
     try:
-        response = meet_service.conferenceRecords().recordings().list(parent=conference_record_name).execute()
+        recordings = []
+        page_token = None
+        while True:
+            request = meet_service.conferenceRecords().recordings().list(
+                parent=conference_record_name,
+                pageSize=100,
+                pageToken=page_token,
+            )
+            response = request.execute()
+            recordings.extend(response.get("recordings", []))
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
     except Exception as exc:
         logger.error("Failed to list recordings for %s: %s", conference_record_name, exc)
         return None
 
-    recordings = response.get("recordings", [])
-    if not recordings:
-        return None
-    return recordings[0].get("driveDestination", {}).get("file")
+    for recording in recordings:
+        # Per the Meet API docs, driveDestination.file is only reliably
+        # populated once the recording session has reached FILE_GENERATED —
+        # earlier states (STARTED, ENDED) mean the MP4 isn't ready yet.
+        if recording.get("state") == "FILE_GENERATED":
+            file_id = recording.get("driveDestination", {}).get("file")
+            if file_id:
+                return file_id
+    if recordings:
+        logger.info("Recording exists for %s but is still processing (states=%s)", conference_record_name, [r.get("state") for r in recordings])
+    return None
+
+
+def _find_drive_recording_file_id(drive_service, session_start, batch_name: str, subject: str) -> Optional[str]:
+    """Fallback for recordings visible in Drive but not returned by Meet API.
+
+    This can happen when the recording was created by a different organizer
+    account, or when Meet has already generated the Drive file but its
+    conference-record resource is unavailable to the OAuth account.
+    """
+    try:
+        start = session_start.replace(tzinfo=timezone.utc)
+        earliest = start.timestamp() - 2 * 60 * 60
+        earliest_iso = datetime.fromtimestamp(earliest, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        queries = [
+            f"name contains '{_escape_drive_query_value(batch_name)}'",
+            f"name contains '{_escape_drive_query_value(subject)}'",
+        ]
+        candidates = {}
+        for name_query in queries:
+            response = drive_service.files().list(
+                q=(
+                    f"trashed = false and mimeType = 'video/mp4' and "
+                    f"createdTime >= '{earliest_iso}' and {name_query}"
+                ),
+                orderBy="createdTime desc",
+                pageSize=100,
+                fields="files(id,name,mimeType,createdTime,webViewLink)",
+            ).execute()
+            for file in response.get("files", []):
+                candidates[file["id"]] = file
+
+        if len(candidates) == 1:
+            file = next(iter(candidates.values()))
+            logger.info("Found recording directly in Drive as fallback: %s (%s)", file["name"], file["id"])
+            return file["id"]
+        if candidates:
+            logger.warning(
+                "Found %d possible Drive recordings for batch '%s'; not moving automatically: %s",
+                len(candidates), batch_name, [file["name"] for file in candidates.values()],
+            )
+    except Exception as exc:
+        logger.error("Drive fallback search failed for batch '%s': %s", batch_name, exc)
+    return None
 
 
 def _find_or_create_folder(drive_service, name: str, parent_id: Optional[str] = None) -> str:
-    query = f"name = '{name}' and mimeType = '{DRIVE_FOLDER_MIME}' and trashed = false"
+    escaped_name = _escape_drive_query_value(name)
+    query = f"name = '{escaped_name}' and mimeType = '{DRIVE_FOLDER_MIME}' and trashed = false"
     if parent_id:
         query += f" and '{parent_id}' in parents"
 
@@ -66,6 +172,8 @@ def _find_or_create_folder(drive_service, name: str, parent_id: Optional[str] = 
     if existing:
         return existing[0]["id"]
 
+    # Use the raw (unescaped) name here — escaping is only needed inside the
+    # `q` query string above, not in the resource body sent to files.create.
     metadata = {"name": name, "mimeType": DRIVE_FOLDER_MIME}
     if parent_id:
         metadata["parents"] = [parent_id]
@@ -89,17 +197,41 @@ def _get_or_create_batch_folder(drive_service, batch: Batch) -> str:
 
 
 def _move_and_rename_file(drive_service, file_id: str, new_parent_id: str, new_name: str) -> str:
-    file_metadata = drive_service.files().get(fileId=file_id, fields="parents").execute()
+    file_metadata = drive_service.files().get(fileId=file_id, fields="parents, name").execute()
     previous_parents = ",".join(file_metadata.get("parents", []))
 
-    updated = drive_service.files().update(
+    update_args = dict(
         fileId=file_id,
         addParents=new_parent_id,
-        removeParents=previous_parents,
         body={"name": new_name},
         fields="id, webViewLink",
-    ).execute()
+    )
+    if previous_parents:
+        update_args["removeParents"] = previous_parents
+    updated = drive_service.files().update(**update_args).execute()
     return updated.get("webViewLink", f"https://drive.google.com/file/d/{file_id}/view")
+
+
+def _unique_recording_name(drive_service, folder_id: str, base_name: str, file_id: str) -> str:
+    """Prevent a same-name Drive file from being renamed over semantically."""
+    stem, extension = base_name.rsplit(".", 1)
+    candidate = base_name
+    suffix = 2
+    while True:
+        escaped = _escape_drive_query_value(candidate)
+        result = drive_service.files().list(
+            q=(
+                f"'{folder_id}' in parents and name = '{escaped}' and "
+                "trashed = false"
+            ),
+            fields="files(id)",
+            pageSize=10,
+        ).execute()
+        conflicts = [item for item in result.get("files", []) if item.get("id") != file_id]
+        if not conflicts:
+            return candidate
+        candidate = f"{stem} ({suffix}).{extension}"
+        suffix += 1
 
 
 def try_file_recording_for_session(meet_service, drive_service, class_session_id: int) -> bool:
@@ -127,11 +259,11 @@ def try_file_recording_for_session(meet_service, drive_service, class_session_id
         return False
 
     conference_record = _find_conference_record(meet_service, space_id, session_start)
-    if not conference_record:
-        logger.debug("No conference record yet for batch '%s' session %s", batch_section_name, session_start)
-        return False
-
-    file_id = _find_recording_file_id(meet_service, conference_record)
+    file_id = _find_recording_file_id(meet_service, conference_record) if conference_record else None
+    if not file_id:
+        file_id = _find_drive_recording_file_id(
+            drive_service, session_start, batch_section_name, batch_subject
+        )
     if not file_id:
         logger.debug("Recording not yet available for batch '%s' session %s", batch_section_name, session_start)
         return False
@@ -140,7 +272,8 @@ def try_file_recording_for_session(meet_service, drive_service, class_session_id
         batch = session.query(Batch).filter_by(id=batch_id).one()
         batch_folder_id = _get_or_create_batch_folder(drive_service, batch)
 
-    new_name = f"{session_start.strftime('%Y-%m-%d')} - {batch_subject}.mp4"
+    base_name = f"{session_start.strftime('%Y-%m-%d %H-%M')} - {batch_subject}.mp4"
+    new_name = _unique_recording_name(drive_service, batch_folder_id, base_name, file_id)
     drive_link = _move_and_rename_file(drive_service, file_id, batch_folder_id, new_name)
 
     with get_session() as session:
