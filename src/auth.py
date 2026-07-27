@@ -51,7 +51,9 @@ def get_credentials() -> Credentials:
         else:
             logger.info("No valid token found — opening browser for one-time login.")
             flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, SCOPES)
-            creds = flow.run_local_server(port=0)
+            # Force Google's account chooser so a browser with multiple signed-in
+            # accounts does not silently authorize the wrong account.
+            creds = flow.run_local_server(port=0, prompt="select_account")
 
         _save_token(creds, token_path)
 
