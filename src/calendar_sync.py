@@ -17,12 +17,15 @@ Usage:
 """
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from src.db import get_session, Batch, ClassSession
 
 logger = logging.getLogger(__name__)
+
+_MEETING_CODE_RE = re.compile(r"meet\.google\.com/([a-z]{3}-[a-z]{4}-[a-z]{3})", re.IGNORECASE)
 
 
 def _extract_meet_link(event: dict) -> Optional[str]:
@@ -33,6 +36,14 @@ def _extract_meet_link(event: dict) -> Optional[str]:
         if entry_point.get("entryPointType") == "video" and entry_point.get("uri"):
             return entry_point["uri"].strip()
     return None
+
+
+def _extract_meeting_code(meet_link: str) -> Optional[str]:
+    """Pulls just the abc-defg-hij code out of a Meet URL, ignoring scheme,
+    trailing slashes, and query params so links only need to match on the
+    part that actually identifies the space."""
+    match = _MEETING_CODE_RE.search(meet_link or "")
+    return match.group(1).lower() if match else None
 
 
 def _parse_event_datetime(event_time: dict) -> Optional[datetime]:
@@ -78,10 +89,16 @@ def sync_recent_and_upcoming_sessions(calendar_service, hours_back: int = 24, ho
 
     with get_session() as session:
         batches = session.query(Batch).all()
-        link_to_batch = {b.meet_link.strip(): b for b in batches}
+        code_to_batch = {}
+        for b in batches:
+            code = _extract_meeting_code(b.meet_link)
+            if code:
+                code_to_batch[code] = b
+            else:
+                logger.warning("Batch '%s' has an unparseable Meet link '%s' — it will never match calendar events.", b.section_name, b.meet_link)
 
-        if not link_to_batch:
-            logger.warning("No batches found in database — nothing to match calendar events against.")
+        if not code_to_batch:
+            logger.warning("No batches with a parseable Meet link found — nothing to match calendar events against.")
             return 0
 
         existing_event_ids = {row.calendar_event_id for row in session.query(ClassSession.calendar_event_id).all()}
@@ -92,7 +109,8 @@ def sync_recent_and_upcoming_sessions(calendar_service, hours_back: int = 24, ho
                 continue
 
             meet_link = _extract_meet_link(event)
-            if not meet_link or meet_link not in link_to_batch:
+            meeting_code = _extract_meeting_code(meet_link) if meet_link else None
+            if not meeting_code or meeting_code not in code_to_batch:
                 continue
 
             start_dt = _parse_event_datetime(event.get("start", {}))
@@ -100,7 +118,7 @@ def sync_recent_and_upcoming_sessions(calendar_service, hours_back: int = 24, ho
             if not start_dt or not end_dt:
                 continue
 
-            batch = link_to_batch[meet_link]
+            batch = code_to_batch[meeting_code]
             session.add(ClassSession(
                 batch_id=batch.id,
                 calendar_event_id=event_id,
