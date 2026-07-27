@@ -36,7 +36,19 @@ def _escape_drive_query_value(value: str) -> str:
 
 def _find_conference_record(meet_service, space_id: str, session_start) -> Optional[str]:
     try:
-        response = meet_service.conferenceRecords().list(filter=f'space.name="{space_id}"').execute()
+        records = []
+        page_token = None
+        while True:
+            request = meet_service.conferenceRecords().list(
+                filter=f'space.name = "{space_id}"',
+                pageSize=100,
+                pageToken=page_token,
+            )
+            response = request.execute()
+            records.extend(response.get("conferenceRecords", []))
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
     except Exception as exc:
         logger.error("Failed to list conference records for space %s: %s", space_id, exc)
         return None
@@ -93,10 +105,60 @@ def _find_recording_file_id(meet_service, conference_record_name: str) -> Option
         logger.error("Failed to list recordings for %s: %s", conference_record_name, exc)
         return None
 
-    recordings = response.get("recordings", [])
-    if not recordings:
-        return None
-    return recordings[0].get("driveDestination", {}).get("file")
+    for recording in recordings:
+        # Per the Meet API docs, driveDestination.file is only reliably
+        # populated once the recording session has reached FILE_GENERATED —
+        # earlier states (STARTED, ENDED) mean the MP4 isn't ready yet.
+        if recording.get("state") == "FILE_GENERATED":
+            file_id = recording.get("driveDestination", {}).get("file")
+            if file_id:
+                return file_id
+    if recordings:
+        logger.info("Recording exists for %s but is still processing (states=%s)", conference_record_name, [r.get("state") for r in recordings])
+    return None
+
+
+def _find_drive_recording_file_id(drive_service, session_start, batch_name: str, subject: str) -> Optional[str]:
+    """Fallback for recordings visible in Drive but not returned by Meet API.
+
+    This can happen when the recording was created by a different organizer
+    account, or when Meet has already generated the Drive file but its
+    conference-record resource is unavailable to the OAuth account.
+    """
+    try:
+        start = session_start.replace(tzinfo=timezone.utc)
+        earliest = start.timestamp() - 2 * 60 * 60
+        earliest_iso = datetime.fromtimestamp(earliest, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        queries = [
+            f"name contains '{_escape_drive_query_value(batch_name)}'",
+            f"name contains '{_escape_drive_query_value(subject)}'",
+        ]
+        candidates = {}
+        for name_query in queries:
+            response = drive_service.files().list(
+                q=(
+                    f"trashed = false and mimeType = 'video/mp4' and "
+                    f"createdTime >= '{earliest_iso}' and {name_query}"
+                ),
+                orderBy="createdTime desc",
+                pageSize=100,
+                fields="files(id,name,mimeType,createdTime,webViewLink)",
+            ).execute()
+            for file in response.get("files", []):
+                candidates[file["id"]] = file
+
+        if len(candidates) == 1:
+            file = next(iter(candidates.values()))
+            logger.info("Found recording directly in Drive as fallback: %s (%s)", file["name"], file["id"])
+            return file["id"]
+        if candidates:
+            logger.warning(
+                "Found %d possible Drive recordings for batch '%s'; not moving automatically: %s",
+                len(candidates), batch_name, [file["name"] for file in candidates.values()],
+            )
+    except Exception as exc:
+        logger.error("Drive fallback search failed for batch '%s': %s", batch_name, exc)
+    return None
 
 
 def _find_or_create_folder(drive_service, name: str, parent_id: Optional[str] = None) -> str:
