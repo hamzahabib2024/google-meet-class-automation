@@ -16,7 +16,7 @@ import logging
 from contextlib import contextmanager
 from datetime import datetime
 
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey, inspect, text
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
 from src.config import settings
@@ -30,7 +30,8 @@ class Batch(Base):
     __tablename__ = "batches"
 
     id = Column(Integer, primary_key=True)
-    section_name = Column(String, nullable=False, unique=True)
+    # Multiple Meet links may intentionally use the same Drive batch folder.
+    section_name = Column(String, nullable=False)
     subject = Column(String, nullable=False)
     meet_link = Column(String, nullable=False)
     meet_space_id = Column(String, nullable=True)   # cached, e.g. "spaces/abc123"
@@ -55,6 +56,12 @@ class ClassSession(Base):
     session_closed = Column(Boolean, default=False)
     recording_filed = Column(Boolean, default=False)
     recording_drive_link = Column(String, nullable=True)
+
+    # Stored in the DB (not in-memory) so retry counts and alert state survive
+    # a process restart — otherwise a restart mid-retry-cycle could reset the
+    # counter to 0 and cause a duplicate "recording never appeared" alert.
+    recording_retry_count = Column(Integer, default=0, nullable=False)
+    recording_alert_sent = Column(Boolean, default=False, nullable=False)
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -86,9 +93,50 @@ def init_db() -> None:
         os.makedirs(db_dir, exist_ok=True)
 
     _engine = create_engine(f"sqlite:///{settings.database_path}", echo=False)
+    _remove_old_batch_name_constraint(_engine)
     Base.metadata.create_all(_engine)
     _SessionLocal = sessionmaker(bind=_engine)
     logger.info("Database initialized at %s", settings.database_path)
+
+
+def _remove_old_batch_name_constraint(engine) -> None:
+    """Migrate databases created when section_name was incorrectly unique."""
+    inspector = inspect(engine)
+    if "batches" not in inspector.get_table_names():
+        return
+
+    has_unique_name = any(
+        index.get("unique") and index.get("column_names") == ["section_name"]
+        for index in inspector.get_indexes("batches")
+    ) or any(
+        constraint.get("column_names") == ["section_name"]
+        for constraint in inspector.get_unique_constraints("batches")
+    )
+    if not has_unique_name:
+        return
+
+    with engine.begin() as connection:
+        connection.execute(text("PRAGMA foreign_keys=OFF"))
+        connection.execute(text("""
+            CREATE TABLE batches_new (
+                id INTEGER NOT NULL PRIMARY KEY,
+                section_name VARCHAR NOT NULL,
+                subject VARCHAR NOT NULL,
+                meet_link VARCHAR NOT NULL,
+                meet_space_id VARCHAR,
+                drive_folder_id VARCHAR,
+                created_at DATETIME
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO batches_new
+                (id, section_name, subject, meet_link, meet_space_id, drive_folder_id, created_at)
+            SELECT id, section_name, subject, meet_link, meet_space_id, drive_folder_id, created_at
+            FROM batches
+        """))
+        connection.execute(text("DROP TABLE batches"))
+        connection.execute(text("ALTER TABLE batches_new RENAME TO batches"))
+        connection.execute(text("PRAGMA foreign_keys=ON"))
 
 
 @contextmanager
